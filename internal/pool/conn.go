@@ -65,33 +65,62 @@ func (cn *Conn) RemoteAddr() net.Addr {
 
 func (cn *Conn) WithReader(
 	ctx context.Context, timeout time.Duration, fn func(rd *proto.Reader) error,
-) error {
+) (err error) {
+	innerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if timeout >= 0 {
 		if err := cn.netConn.SetReadDeadline(cn.deadline(ctx, timeout)); err != nil {
 			return err
 		}
 	}
-	return fn(cn.rd)
+	go func() {
+		select {
+		// When the parent context is cancelled, trigger any underlying read to time out by setting deadline in past
+		case <-ctx.Done():
+			_ = cn.netConn.SetReadDeadline(time.Unix(0, 0))
+		case <-innerCtx.Done():
+			// Nothing to do in case where the function exits on its own
+		}
+	}()
+	err = fn(cn.rd)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	return err
 }
 
 func (cn *Conn) WithWriter(
 	ctx context.Context, timeout time.Duration, fn func(wr *proto.Writer) error,
-) error {
+) (err error) {
+	innerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if timeout >= 0 {
 		if err := cn.netConn.SetWriteDeadline(cn.deadline(ctx, timeout)); err != nil {
 			return err
 		}
 	}
+	go func() {
+		select {
+		// When the parent context is cancelled, trigger any underlying read to time out by setting deadline in past
+		case <-ctx.Done():
+			_ = cn.netConn.SetWriteDeadline(time.Unix(0, 0))
+		case <-innerCtx.Done():
+			// Nothing to do in case where the function exits on its own
+		}
+	}()
 
 	if cn.bw.Buffered() > 0 {
 		cn.bw.Reset(cn.netConn)
 	}
 
-	if err := fn(cn.wr); err != nil {
-		return err
+	if err = fn(cn.wr); err == nil {
+		err = cn.bw.Flush()
 	}
 
-	return cn.bw.Flush()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	return err
 }
 
 func (cn *Conn) Close() error {
