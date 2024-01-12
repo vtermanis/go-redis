@@ -676,7 +676,10 @@ func (c *Client) init() {
 		c.pubsubNewConn = func(ctx context.Context, channels []string) (*pool.Conn, error) {
 			return c.newConn(ctx)
 		}
-		c.pubsubCloseConn = c.connPool.CloseConn
+		// wrapping in closure since pool has not been initialised yet
+		c.pubsubCloseConn = func(conn *pool.Conn) error {
+			return c.connPool.CloseConn(conn)
+		}
 	}
 }
 
