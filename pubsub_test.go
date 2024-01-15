@@ -12,7 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var _ = Describe("PubSub", Focus, func() {
+var _ = Describe("PubSub", func() {
 	var client *redis.Client
 
 	BeforeEach(func() {
@@ -587,22 +587,7 @@ var _ = Describe("PubSub", Focus, func() {
 		Expect(msg.Payload).To(Equal(text))
 	})
 
-	/*
-		How to run (no need to compile/download redis - start in container):
-
-		RE_CLUSTER=1 ~/go/bin/ginkgo -v --label-filter=pubsubnew
-
-
-			   TODO
-
-			   - get/return without new flag
-			   - get/return with new flag (checking that connection no longer resides in idle pool)
-			   		.. but how to check?  If minidle=0.. should not be added back to idle pool
-				- new flag respects pool size limit (timeout stat?)
-
-	*/
-
-	It("should not use connections from pool", Label("pubsubnew"), func() {
+	It("should not use connections from pool", func() {
 		statsBefore := client.PoolStats()
 
 		pubsub := client.Subscribe(ctx, "mychannel")
@@ -613,15 +598,89 @@ var _ = Describe("PubSub", Focus, func() {
 		Expect(stats.TotalConns - statsBefore.TotalConns).To(Equal(uint32(1)))
 		// But it's not taken from the pool
 		Expect(stats.Hits - statsBefore.Hits).To(Equal(uint32(0)))
-		Expect(stats.Misses - statsBefore.Hits).To(Equal(uint32(1)))
+		Expect(stats.Misses - statsBefore.Misses).To(Equal(uint32(0)))
 
 		pubsub.Close()
 
 		stats = client.PoolStats()
 		// The connection no longer exists
 		Expect(stats.TotalConns - statsBefore.TotalConns).To(Equal(uint32(0)))
-		Expect(stats.Hits - statsBefore.Hits).To(Equal(uint32(0)))
-		Expect(stats.Misses - statsBefore.Hits).To(Equal(uint32(1)))
 		Expect(stats.IdleConns - statsBefore.IdleConns).To(Equal(uint32(0)))
+	})
+})
+
+var _ = Describe("PubSub with PubsubFromPool set", func() {
+	var client *redis.Client
+
+	BeforeEach(func() {
+		opt := redisOptions()
+		opt.MinIdleConns = 0
+		opt.ConnMaxLifetime = 0
+		opt.PubsubFromPool = true
+		// zero value ends up using default so set small instead
+		opt.PoolTimeout = time.Microsecond
+		client = redis.NewClient(opt)
+		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+	})
+
+	It("should use connection from pool", func() {
+		statsBefore := client.PoolStats()
+
+		pubsub := client.Subscribe(ctx, "mychannel")
+		defer pubsub.Close()
+
+		stats := client.PoolStats()
+		// A connection has been taken from the pool
+		Expect(stats.Hits - statsBefore.Hits).To(Equal(uint32(1)))
+		statsDuring := client.PoolStats()
+
+		pubsub.Close()
+
+		stats = client.PoolStats()
+		// And it's not returned to the idle pool (and is terminated)
+		Expect(statsDuring.IdleConns - stats.IdleConns).To(Equal(uint32(0)))
+		Expect(statsDuring.TotalConns - stats.TotalConns).To(Equal(uint32(1)))
+	})
+
+	It("should respect pool size limit", func() {
+		poolSize := client.Options().PoolSize
+		statsBefore := client.PoolStats()
+
+		var pubsubs []*redis.PubSub
+		for i := 0; i < poolSize; i++ {
+			pubsub := client.Subscribe(ctx, "mychannel")
+			defer pubsub.Close()
+			pubsubs = append(pubsubs, pubsub)
+		}
+
+		statsDuring := client.PoolStats()
+
+		// A total of poolSize connections should have been taken from the pool (new or existing)
+		Expect(
+			(statsDuring.Hits + statsDuring.Misses) - (statsBefore.Hits + statsBefore.Misses),
+		).To(Equal(uint32(poolSize)))
+
+		// The next pubsub connection should fail to connect (waiting for pool)
+		extraPubsub := client.Subscribe(ctx, "mychannel")
+		defer extraPubsub.Close()
+		Expect(client.PoolStats().Timeouts - statsDuring.Timeouts).To(Equal(uint32(1)))
+
+		// As should retries
+		err := extraPubsub.Ping(ctx)
+		Expect(err).To(MatchError(ContainSubstring("connection pool timeout")))
+		Expect(client.PoolStats().Timeouts - statsDuring.Timeouts).To(Equal(uint32(2)))
+
+		for _, pubsub := range pubsubs {
+			pubsub.Close()
+		}
+
+		stats := client.PoolStats()
+		// Connections are not returned to the pool (and have been terminated)
+		Expect(statsDuring.IdleConns - stats.IdleConns).To(Equal(uint32(0)))
+		Expect(statsDuring.TotalConns - stats.TotalConns).To(Equal(uint32(10)))
 	})
 })
