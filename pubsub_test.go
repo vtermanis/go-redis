@@ -12,7 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var _ = Describe("PubSub", func() {
+var _ = Describe("PubSub", Focus, func() {
 	var client *redis.Client
 
 	BeforeEach(func() {
@@ -566,5 +566,62 @@ var _ = Describe("PubSub", func() {
 		Eventually(ch).Should(Receive(&msg))
 		Expect(msg.Channel).To(Equal("mychannel"))
 		Expect(msg.Payload).To(Equal(text))
+	})
+
+	It("should ChannelMessage", func() {
+		pubsub := client.Subscribe(ctx, "mychannel")
+		defer pubsub.Close()
+
+		ch := pubsub.Channel(
+			redis.WithChannelSize(10),
+			redis.WithChannelHealthCheckInterval(time.Second),
+		)
+
+		text := "test channel message"
+		err := client.Publish(ctx, "mychannel", text).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var msg *redis.Message
+		Eventually(ch).Should(Receive(&msg))
+		Expect(msg.Channel).To(Equal("mychannel"))
+		Expect(msg.Payload).To(Equal(text))
+	})
+
+	/*
+		How to run (no need to compile/download redis - start in container):
+
+		RE_CLUSTER=1 ~/go/bin/ginkgo -v --label-filter=pubsubnew
+
+
+			   TODO
+
+			   - get/return without new flag
+			   - get/return with new flag (checking that connection no longer resides in idle pool)
+			   		.. but how to check?  If minidle=0.. should not be added back to idle pool
+				- new flag respects pool size limit (timeout stat?)
+
+	*/
+
+	It("should not use connections from pool", Label("pubsubnew"), func() {
+		statsBefore := client.PoolStats()
+
+		pubsub := client.Subscribe(ctx, "mychannel")
+		defer pubsub.Close()
+
+		stats := client.PoolStats()
+		// A connection has been created
+		Expect(stats.TotalConns - statsBefore.TotalConns).To(Equal(uint32(1)))
+		// But it's not taken from the pool
+		Expect(stats.Hits - statsBefore.Hits).To(Equal(uint32(0)))
+		Expect(stats.Misses - statsBefore.Hits).To(Equal(uint32(1)))
+
+		pubsub.Close()
+
+		stats = client.PoolStats()
+		// The connection no longer exists
+		Expect(stats.TotalConns - statsBefore.TotalConns).To(Equal(uint32(0)))
+		Expect(stats.Hits - statsBefore.Hits).To(Equal(uint32(0)))
+		Expect(stats.Misses - statsBefore.Hits).To(Equal(uint32(1)))
+		Expect(stats.IdleConns - statsBefore.IdleConns).To(Equal(uint32(0)))
 	})
 })
