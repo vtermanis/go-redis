@@ -92,6 +92,12 @@ type Options struct {
 	// ContextTimeoutEnabled controls whether the client respects context timeouts and deadlines.
 	// See https://redis.uptrace.dev/guide/go-redis-debugging.html#timeouts
 	ContextTimeoutEnabled bool
+	// ConnectionReadHook can be used, in combination with ContextTimeoutEnabled, to react to context cancellation by
+	// explicitly setting the read deadline. This can be achieved by e.g. awaiting context cancellation in a separate
+	// routine or by using context.AfterFunc (go 1.21+).
+	// Warning: Usage of such hooks is likely to result in a performance penalty and any other modifications of the
+	// underlying socket can cause undefined behaviour!
+	ConnDeadlineHooks ReadWriteDeadlineHooks
 
 	// Type of connection pool.
 	// true for FIFO pool, false for LIFO pool.

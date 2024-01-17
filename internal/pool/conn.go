@@ -12,6 +12,27 @@ import (
 
 var noDeadline = time.Time{}
 
+type ReadWriteFinishedCallback func()
+
+// ReadWriteDeadlineHooks allows for context cancellation/expiry behaviour
+// to be applied to the underlying connection. Note that the hook-calling
+// methods (WithReader/WithWriter) already handle timeouts if
+// ContextTimeoutEnabled is enabled.
+// These hooks can optionally return a function which will be called once
+// the read or write has finished (or failed).
+type ReadWriteDeadlineHooks interface {
+	ReadDeadlineSetter(context.Context, ReadDeadlineSetter) ReadWriteFinishedCallback
+	WriteDeadlineSetter(context.Context, WriteDeadlineSetter) ReadWriteFinishedCallback
+}
+
+type ReadDeadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
+type WriteDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
 type Conn struct {
 	usedAt  int64 // atomic
 	netConn net.Conn
@@ -23,13 +44,21 @@ type Conn struct {
 	Inited    bool
 	pooled    bool
 	createdAt time.Time
+
+	deadlineHooks ReadWriteDeadlineHooks
 }
 
 func NewConn(netConn net.Conn) *Conn {
+	return NewConnWithDeadlineHooks(netConn, nil)
+}
+
+func NewConnWithDeadlineHooks(netConn net.Conn, deadlineHooks ReadWriteDeadlineHooks) *Conn {
 	cn := &Conn{
-		netConn:   netConn,
-		createdAt: time.Now(),
+		netConn:       netConn,
+		createdAt:     time.Now(),
+		deadlineHooks: deadlineHooks,
 	}
+
 	cn.rd = proto.NewReader(netConn)
 	cn.bw = bufio.NewWriter(netConn)
 	cn.wr = proto.NewWriter(cn.bw)
@@ -71,6 +100,13 @@ func (cn *Conn) WithReader(
 			return err
 		}
 	}
+	var finished ReadWriteFinishedCallback
+	if cn.deadlineHooks != nil {
+		finished = cn.deadlineHooks.ReadDeadlineSetter(ctx, cn.netConn)
+		if finished != nil {
+			defer finished()
+		}
+	}
 	return fn(cn.rd)
 }
 
@@ -80,6 +116,13 @@ func (cn *Conn) WithWriter(
 	if timeout >= 0 {
 		if err := cn.netConn.SetWriteDeadline(cn.deadline(ctx, timeout)); err != nil {
 			return err
+		}
+	}
+	var finished ReadWriteFinishedCallback
+	if cn.deadlineHooks != nil {
+		finished = cn.deadlineHooks.ReadDeadlineSetter(ctx, cn.netConn)
+		if finished != nil {
+			defer finished()
 		}
 	}
 

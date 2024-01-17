@@ -60,14 +60,15 @@ type Pooler interface {
 type Options struct {
 	Dialer func(context.Context) (net.Conn, error)
 
-	PoolFIFO        bool
-	PoolSize        int
-	PoolTimeout     time.Duration
-	MinIdleConns    int
-	MaxIdleConns    int
-	MaxActiveConns  int
-	ConnMaxIdleTime time.Duration
-	ConnMaxLifetime time.Duration
+	PoolFIFO          bool
+	PoolSize          int
+	PoolTimeout       time.Duration
+	MinIdleConns      int
+	MaxIdleConns      int
+	MaxActiveConns    int
+	ConnMaxIdleTime   time.Duration
+	ConnMaxLifetime   time.Duration
+	ConnDeadlineHooks ReadWriteDeadlineHooks
 }
 
 type lastDialErrorWrap struct {
@@ -82,9 +83,10 @@ type ConnPool struct {
 
 	queue chan struct{}
 
-	connsMu   sync.Mutex
-	conns     []*Conn
-	idleConns []*Conn
+	connsMu       sync.Mutex
+	conns         []*Conn
+	idleConns     []*Conn
+	deadlineHooks ReadWriteDeadlineHooks
 
 	poolSize     int
 	idleConnsLen int
@@ -100,9 +102,10 @@ func NewConnPool(opt *Options) *ConnPool {
 	p := &ConnPool{
 		cfg: opt,
 
-		queue:     make(chan struct{}, opt.PoolSize),
-		conns:     make([]*Conn, 0, opt.PoolSize),
-		idleConns: make([]*Conn, 0, opt.PoolSize),
+		queue:         make(chan struct{}, opt.PoolSize),
+		conns:         make([]*Conn, 0, opt.PoolSize),
+		idleConns:     make([]*Conn, 0, opt.PoolSize),
+		deadlineHooks: opt.ConnDeadlineHooks,
 	}
 
 	p.connsMu.Lock()
@@ -211,7 +214,7 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 		return nil, err
 	}
 
-	cn := NewConn(netConn)
+	cn := NewConnWithDeadlineHooks(netConn, p.deadlineHooks)
 	cn.pooled = pooled
 	return cn, nil
 }

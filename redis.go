@@ -18,6 +18,9 @@ import (
 // Scanner internal/hscan.Scanner exposed interface.
 type Scanner = hscan.Scanner
 
+// ReadWriteDeadlineSetter pool internal/pool exposed function definition (for read/write context control)
+type ReadWriteDeadlineHooks = pool.ReadWriteDeadlineHooks
+
 // Nil reply returned by Redis when key does not exist.
 const Nil = proto.Nil
 
