@@ -62,6 +62,9 @@ func (c *PubSub) conn(ctx context.Context, newChannels []string) (*pool.Conn, er
 	if c.closed {
 		return nil, pool.ErrClosed
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.cn != nil {
 		return c.cn, nil
 	}
@@ -84,9 +87,16 @@ func (c *PubSub) conn(ctx context.Context, newChannels []string) (*pool.Conn, er
 }
 
 func (c *PubSub) writeCmd(ctx context.Context, cn *pool.Conn, cmd Cmder) error {
-	return cn.WithWriter(context.Background(), c.opt.WriteTimeout, func(wr *proto.Writer) error {
+	return cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
 		return writeCmd(wr, cmd)
 	})
+}
+
+func (c *PubSub) context(ctx context.Context) context.Context {
+	if c.opt.ContextTimeoutEnabled {
+		return ctx
+	}
+	return context.Background()
 }
 
 func (c *PubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
@@ -148,6 +158,9 @@ func (c *PubSub) releaseConnWithLock(
 
 func (c *PubSub) releaseConn(ctx context.Context, cn *pool.Conn, err error, allowTimeout bool) {
 	if c.cn != cn {
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	if isBadConn(err, allowTimeout, c.opt.Addr) {
@@ -432,7 +445,7 @@ func (c *PubSub) ReceiveTimeout(ctx context.Context, timeout time.Duration) (int
 		return nil, err
 	}
 
-	err = cn.WithReader(context.Background(), timeout, func(rd *proto.Reader) error {
+	err = cn.WithReader(c.context(ctx), timeout, func(rd *proto.Reader) error {
 		return c.cmd.readReply(rd)
 	})
 
@@ -486,7 +499,8 @@ func (c *PubSub) getContext() context.Context {
 //------------------------------------------------------------------------------
 
 // Channel returns a Go channel for concurrently receiving messages.
-// The channel is closed together with the PubSub. If the Go channel
+// The channel is closed together with the PubSub (or when the context
+// provided via WithChannelContext is done). If the Go channel
 // is blocked full for 1 minute the message is dropped.
 // Receive* APIs can not be used after channel is created.
 //
@@ -561,9 +575,20 @@ func WithChannelSendTimeout(d time.Duration) ChannelOption {
 	}
 }
 
+// WithChannelContext specifies the context to use for subscription reads.
+// This allows for subscriptions to be terminated on context timeout (if
+// ContextTimeoutEnabled is set) as well as cancellation (if a connection
+// read/write hook is configured). TODO - link to conf option
+func WithChannelContext(ctx context.Context) ChannelOption {
+	return func(c *channel) {
+		c.ctx = ctx
+	}
+}
+
 type channel struct {
 	pubSub *PubSub
 
+	ctx   context.Context
 	msgCh chan *Message
 	allCh chan interface{}
 	ping  chan struct{}
@@ -577,6 +602,7 @@ func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
 	c := &channel{
 		pubSub: pubSub,
 
+		ctx:             context.Background(),
 		chanSize:        100,
 		chanSendTimeout: time.Minute,
 		checkInterval:   3 * time.Second,
@@ -591,7 +617,7 @@ func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
 }
 
 func (c *channel) initHealthCheck() {
-	ctx := context.TODO()
+	ctx := c.ctx
 	c.ping = make(chan struct{}, 1)
 
 	go func() {
@@ -607,10 +633,16 @@ func (c *channel) initHealthCheck() {
 				}
 			case <-timer.C:
 				if pingErr := c.pubSub.Ping(ctx); pingErr != nil {
+					// No point in reconnecting if context done
+					if ctx.Err() != nil {
+						return
+					}
 					c.pubSub.mu.Lock()
-					c.pubSub.reconnect(ctx, pingErr)
+					c.pubSub.reconnect(c.ctx, pingErr)
 					c.pubSub.mu.Unlock()
 				}
+			case <-c.ctx.Done():
+				return
 			case <-c.pubSub.exit:
 				return
 			}
@@ -620,10 +652,11 @@ func (c *channel) initHealthCheck() {
 
 // initMsgChan must be in sync with initAllChan.
 func (c *channel) initMsgChan() {
-	ctx := context.TODO()
+	ctx := c.ctx
 	c.msgCh = make(chan *Message, c.chanSize)
 
 	go func() {
+		defer close(c.msgCh)
 		timer := time.NewTimer(time.Minute)
 		timer.Stop()
 
@@ -631,8 +664,8 @@ func (c *channel) initMsgChan() {
 		for {
 			msg, err := c.pubSub.Receive(ctx)
 			if err != nil {
-				if err == pool.ErrClosed {
-					close(c.msgCh)
+				switch err {
+				case pool.ErrClosed, context.Canceled, context.DeadlineExceeded:
 					return
 				}
 				if errCount > 0 {
@@ -666,6 +699,8 @@ func (c *channel) initMsgChan() {
 					internal.Logger.Printf(
 						ctx, "redis: %s channel is full for %s (message is dropped)",
 						c, c.chanSendTimeout)
+				case <-ctx.Done():
+					return
 				}
 			default:
 				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)
@@ -676,10 +711,11 @@ func (c *channel) initMsgChan() {
 
 // initAllChan must be in sync with initMsgChan.
 func (c *channel) initAllChan() {
-	ctx := context.TODO()
+	ctx := c.ctx
 	c.allCh = make(chan interface{}, c.chanSize)
 
 	go func() {
+		defer close(c.allCh)
 		timer := time.NewTimer(time.Minute)
 		timer.Stop()
 
@@ -687,8 +723,8 @@ func (c *channel) initAllChan() {
 		for {
 			msg, err := c.pubSub.Receive(ctx)
 			if err != nil {
-				if err == pool.ErrClosed {
-					close(c.allCh)
+				switch err {
+				case pool.ErrClosed, context.Canceled, context.DeadlineExceeded:
 					return
 				}
 				if errCount > 0 {
@@ -720,6 +756,8 @@ func (c *channel) initAllChan() {
 					internal.Logger.Printf(
 						ctx, "redis: %s channel is full for %s (message is dropped)",
 						c, c.chanSendTimeout)
+				case <-ctx.Done():
+					return
 				}
 			default:
 				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)
